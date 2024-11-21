@@ -1,159 +1,114 @@
-Crafting Interpreters Notes
 import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { v1 } from '@google-cloud/pubsub'
-import { QueueService } from './queue-service' // adjust path as needed
+import { Scanner } from './scanner'
+import { QueueService } from './queue-service'
 
-// Mock Google Cloud PubSub
-vi.mock('@google-cloud/pubsub', () => {
-  return {
-    v1: {
-      SubscriberClient: vi.fn().mockImplementation(() => ({
-        projectPath: vi.fn().mockReturnValue('test-project-path'),
-        subscriptionPath: vi.fn().mockReturnValue('test-subscription-path'),
-        acknowledge: vi.fn().mockResolvedValue([]),
-        pull: vi.fn().mockImplementation(() => [{
-          receivedMessages: [{
-            message: { data: Buffer.from('test message'), },
-            ackId: 'test-ack-id'
-          }]
-        }])
-      }))
-    }
-  }
-})
+vi.mock('./queue-service', () => ({
+  QueueService: vi.fn().mockImplementation(() => ({
+    getSubClient: vi.fn().mockResolvedValue({
+      pull: vi.fn()
+    }),
+    requestMsg: {
+      subscription: 'test-subscription',
+      maxMessages: 10
+    },
+    fetchMessages: vi.fn()
+  }))
+}))
 
-describe('QueueService', () => {
-  let queueService: QueueService
-  let mockSubClient: v1.SubscriberClient
+describe('Scanner', () => {
+  let scanner: Scanner
+  let mockQueueService: jest.Mocked<QueueService>
 
   beforeEach(() => {
-    queueService = new QueueService()
-    mockSubClient = new v1.SubscriberClient()
+    vi.resetAllMocks()
+    mockQueueService = new QueueService() as jest.Mocked<QueueService>
+    scanner = new Scanner(mockQueueService)
+    // Mock loopPromise to avoid infinite loop
+    scanner.loopPromise = vi.fn().mockResolvedValue(undefined)
   })
 
-  describe('getSubClient', () => {
-    it('should create and return a subscriber client', async () => {
+  describe('startListening', () => {
+    it('should initialize subclient and create 5 concurrent loops', async () => {
       // Act
-      const client = await queueService.getSubClient()
+      await scanner.startListening()
 
       // Assert
-      expect(client).toBeDefined()
-      expect(client.projectPath).toBeDefined()
-      expect(client.subscriptionPath).toBeDefined()
+      expect(mockQueueService.getSubClient).toHaveBeenCalledTimes(1)
+      expect(scanner.loopPromise).toHaveBeenCalledTimes(5)
     })
 
-    it('should handle client creation errors', async () => {
+    it('should wait for all promises to resolve', async () => {
       // Arrange
-      vi.mocked(v1.SubscriberClient).mockImplementationOnce(() => {
-        throw new Error('Failed to create client')
+      let resolveCount = 0
+      scanner.loopPromise = vi.fn().mockImplementation(async () => {
+        resolveCount++
+        await new Promise(resolve => setTimeout(resolve, 10))
+        return undefined
       })
+
+      // Act
+      await scanner.startListening()
+
+      // Assert
+      expect(resolveCount).toBe(5)
+    })
+
+    it('should handle getSubClient error', async () => {
+      // Arrange
+      vi.mocked(mockQueueService.getSubClient).mockRejectedValueOnce(new Error('Failed to get client'))
 
       // Act & Assert
-      await expect(queueService.getSubClient()).rejects.toThrow('Failed to create client')
-    })
-  })
-
-  describe('fetchMessages', () => {
-    it('should fetch messages successfully', async () => {
-      // Arrange
-      const subscriptionRequest = {
-        subscription: 'test-subscription',
-        project: 'test-project',
-        maxMessages: 10
-      }
-
-      // Act
-      const result = await queueService.fetchMessages(mockSubClient, subscriptionRequest)
-
-      // Assert
-      expect(result).toBeDefined()
-      expect(mockSubClient.pull).toHaveBeenCalled()
-      expect(mockSubClient.subscriptionPath).toHaveBeenCalledWith(
-        subscriptionRequest.project,
-        subscriptionRequest.subscription
-      )
+      await expect(scanner.startListening()).rejects.toThrow('Failed to get client')
+      expect(scanner.loopPromise).not.toHaveBeenCalled()
     })
 
-    it('should handle empty message responses', async () => {
+    it('should handle loop promise errors', async () => {
       // Arrange
-      vi.mocked(mockSubClient.pull).mockResolvedValueOnce([{ receivedMessages: [] }])
-      
-      const subscriptionRequest = {
-        subscription: 'test-subscription',
-        project: 'test-project',
-        maxMessages: 10
-      }
-
-      // Act
-      const result = await queueService.fetchMessages(mockSubClient, subscriptionRequest)
-
-      // Assert
-      expect(result.receivedMessages).toHaveLength(0)
-    })
-
-    it('should handle pull errors', async () => {
-      // Arrange
-      vi.mocked(mockSubClient.pull).mockRejectedValueOnce(new Error('Pull failed'))
-      
-      const subscriptionRequest = {
-        subscription: 'test-subscription',
-        project: 'test-project',
-        maxMessages: 10
-      }
+      scanner.loopPromise = vi.fn()
+        .mockRejectedValueOnce(new Error('Loop 1 failed'))
+        .mockResolvedValue(undefined)
 
       // Act & Assert
-      await expect(queueService.fetchMessages(mockSubClient, subscriptionRequest))
-        .rejects.toThrow('Pull failed')
+      await expect(scanner.startListening()).rejects.toThrow('Loop 1 failed')
     })
 
-    it('should respect maxMessages parameter', async () => {
-      // Arrange
-      const subscriptionRequest = {
-        subscription: 'test-subscription',
-        project: 'test-project',
-        maxMessages: 5
-      }
-
+    it('should set up subclient and subscription request correctly', async () => {
       // Act
-      await queueService.fetchMessages(mockSubClient, subscriptionRequest)
+      await scanner.startListening()
 
       // Assert
-      expect(mockSubClient.pull).toHaveBeenCalledWith({
-        subscription: expect.any(String),
-        maxMessages: 5
-      })
+      expect(scanner.subclient).toBeDefined()
+      expect(scanner.subscriptionRequest).toEqual(mockQueueService.requestMsg)
     })
 
-    it('should correctly format received messages', async () => {
+    it('should handle multiple concurrent loop failures', async () => {
       // Arrange
-      const testMessage = 'test message data'
-      vi.mocked(mockSubClient.pull).mockResolvedValueOnce([{
-        receivedMessages: [{
-          message: {
-            data: Buffer.from(testMessage),
-            attributes: { key: 'value' }
-          },
-          ackId: 'test-ack-id'
-        }]
-      }])
+      scanner.loopPromise = vi.fn()
+        .mockRejectedValueOnce(new Error('Loop 1 failed'))
+        .mockRejectedValueOnce(new Error('Loop 2 failed'))
+        .mockResolvedValue(undefined)
 
-      const subscriptionRequest = {
-        subscription: 'test-subscription',
-        project: 'test-project',
-        maxMessages: 10
-      }
+      // Act & Assert
+      await expect(scanner.startListening()).rejects.toThrow(/Loop [12] failed/)
+    })
+
+    it('should maintain correct number of concurrent loops', async () => {
+      // Arrange
+      const loopPromises: Promise<void>[] = []
+      scanner.loopPromise = vi.fn().mockImplementation(() => {
+        const promise = new Promise<void>(resolve => setTimeout(resolve, 10))
+        loopPromises.push(promise)
+        return promise
+      })
 
       // Act
-      const result = await queueService.fetchMessages(mockSubClient, subscriptionRequest)
-
+      const startListeningPromise = scanner.startListening()
+      
       // Assert
-      expect(result.receivedMessages[0]).toEqual({
-        message: {
-          data: Buffer.from(testMessage),
-          attributes: { key: 'value' }
-        },
-        ackId: 'test-ack-id'
-      })
+      // Check that all 5 loops are started before any complete
+      expect(loopPromises.length).toBe(5)
+      
+      await startListeningPromise
     })
   })
 })
