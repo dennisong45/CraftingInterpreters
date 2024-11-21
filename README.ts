@@ -1,150 +1,102 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest'
-import { Scanner } from './scanner'
-import { QueueService } from './Queue'
-import { v1 } from '@google-cloud/pubsub'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { ScannerService } from './ScannerService'
+import { Queue, QueueService } from './Queue'
+import { JourneyService } from './JourneyService'
 
-const mockSubscriberClient = {
-  pull: vi.fn()
-} as unknown as v1.SubscriberClient
-
-vi.mock('./Queue', () => ({
-  QueueService: vi.fn().mockImplementation(() => ({
-    getSubClient: vi.fn().mockResolvedValue(mockSubscriberClient),
-    fetchMessages: vi.fn().mockResolvedValue({
-      receivedMessages: [{
-        message: { data: Buffer.from('test message') }
-      }]
-    }),
-    requestMsg: {
-      subscription: 'test-subscription',
-      maxMessages: 10
-    }
-  }))
-}))
-
-describe('Scanner', () => {
-  let scanner: Scanner
-  let mockQueueService: QueueService
-
+describe('ScannerService', () => {
+  let scannerService: ScannerService
+  let mockSubclient: any
+  let mockFetchMessages: ReturnType<typeof vi.fn>
+  let mockCoordinatorSingleton: any
+  
   beforeEach(() => {
-    vi.resetAllMocks()
-    mockQueueService = new QueueService()
-    scanner = new Scanner(mockQueueService)
+    mockSubclient = {
+      acknowledge: vi.fn().mockResolvedValue({}),
+      modifyAckDeadline: vi.fn().mockResolvedValue({})
+    }
+    mockFetchMessages = vi.fn()
+    mockCoordinatorSingleton = {}
+    
+    QueueService.prototype.fetchMessages = mockFetchMessages
+    
+    scannerService = new ScannerService()
+    // Spy on console.log
+    vi.spyOn(console, 'log')
   })
 
-  describe('loopPromise', () => {
-    it('should process messages in a loop until error occurs', async () => {
-      // Arrange
-      let loopCount = 0
-      vi.mocked(mockQueueService.fetchMessages).mockImplementation(async () => {
-        loopCount++
-        if (loopCount >= 3) {
-          // Stop the loop after 3 iterations
-          throw new Error('Stop loop')
+  it('should process message and start journey when message received', async () => {
+    const responseMessage = {
+      receivedMessages: [{
+        message: {
+          data: {
+            toString: () => 'test message data'
+          }
         }
-        return {
-          receivedMessages: [{
-            message: { data: Buffer.from('test message') }
-          }]
+      }]
+    }
+    mockFetchMessages.mockResolvedValue(responseMessage)
+
+    const promise = scannerService.loopPromise()
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Verify console logs
+    expect(console.log).toHaveBeenCalledWith('Message Received')
+    
+    // Verify JourneyService instantiation and startJourney call
+    expect(JourneyService).toHaveBeenCalledWith(
+      expect.anything(), // coordinatorSingleton
+      expect.anything(), // projectConfig
+      'test message data'  // message data
+    )
+    
+    // Verify acknowledgment
+    expect(console.log).toHaveBeenCalledWith('Acknowledged')
+    expect(mockSubclient.acknowledge).toHaveBeenCalledWith(
+      expect.any(Object) // QueueService.makeAckRequest result
+    )
+
+    mockFetchMessages.mockRejectedValueOnce(new Error('Stop loop'))
+    await expect(promise).rejects.toThrow('Stop loop')
+  })
+
+  it('should handle errors in journey processing', async () => {
+    const responseMessage = {
+      receivedMessages: [{
+        message: {
+          data: {
+            toString: () => 'test message data'
+          }
         }
-      })
+      }]
+    }
+    mockFetchMessages.mockResolvedValue(responseMessage)
+    
+    // Mock JourneyService to throw error
+    vi.spyOn(JourneyService.prototype, 'startJourney')
+      .mockRejectedValue(new Error('Journey error'))
 
-      // Act
-      try {
-        await scanner.loopPromise()
-      } catch (error) {
-        expect(error.message).toBe('Stop loop')
-      }
+    const promise = scannerService.loopPromise()
+    await new Promise(resolve => setTimeout(resolve, 0))
 
-      // Assert
-      expect(loopCount).toBe(3)
-      expect(mockQueueService.fetchMessages).toHaveBeenCalledTimes(3)
-    })
+    // Verify error handling
+    expect(console.log).toHaveBeenCalledWith('Error in Dora', expect.any(Error))
+    expect(mockSubclient.modifyAckDeadline).toHaveBeenCalledWith(
+      expect.any(Object) // QueueService.makeNackRequest result
+    )
 
-    it('should process different types of messages', async () => {
-      // Arrange
-      const messages = [
-        { data: 'message1' },
-        { data: 'message2' },
-        { data: 'message3' }
-      ]
-      
-      let messageIndex = 0
-      vi.mocked(mockQueueService.fetchMessages).mockImplementation(async () => {
-        if (messageIndex >= messages.length) {
-          throw new Error('Stop loop')
-        }
-        
-        return {
-          receivedMessages: [{
-            message: { 
-              data: Buffer.from(messages[messageIndex++].data) 
-            }
-          }]
-        }
-      })
+    mockFetchMessages.mockRejectedValueOnce(new Error('Stop loop'))
+    await expect(promise).rejects.toThrow('Stop loop')
+  })
 
-      // Mock startJourney if you have it
-      scanner.startJourney = vi.fn()
+  it('should log when no message received', async () => {
+    mockFetchMessages.mockResolvedValue(null)
 
-      // Act
-      try {
-        await scanner.loopPromise()
-      } catch (error) {
-        expect(error.message).toBe('Stop loop')
-      }
+    const promise = scannerService.loopPromise()
+    await new Promise(resolve => setTimeout(resolve, 0))
 
-      // Assert
-      expect(scanner.startJourney).toHaveBeenCalledTimes(3)
-      expect(messageIndex).toBe(3)
-    })
+    expect(console.log).toHaveBeenCalledWith('No Message For Dora', null)
 
-    it('should handle empty message responses', async () => {
-      // Arrange
-      let loopCount = 0
-      vi.mocked(mockQueueService.fetchMessages).mockImplementation(async () => {
-        loopCount++
-        if (loopCount >= 3) {
-          throw new Error('Stop loop')
-        }
-        return { receivedMessages: [] }
-      })
-
-      // Act
-      try {
-        await scanner.loopPromise()
-      } catch (error) {
-        expect(error.message).toBe('Stop loop')
-      }
-
-      // Assert
-      expect(loopCount).toBe(3)
-      expect(mockQueueService.fetchMessages).toHaveBeenCalledTimes(3)
-    })
-
-    it('should handle fetch errors and continue loop', async () => {
-      // Arrange
-      let loopCount = 0
-      vi.mocked(mockQueueService.fetchMessages).mockImplementation(async () => {
-        loopCount++
-        if (loopCount === 1) {
-          throw new Error('Fetch failed')
-        }
-        if (loopCount >= 3) {
-          throw new Error('Stop loop')
-        }
-        return { receivedMessages: [] }
-      })
-
-      // Act
-      try {
-        await scanner.loopPromise()
-      } catch (error) {
-        expect(error.message).toBe('Stop loop')
-      }
-
-      // Assert
-      expect(loopCount).toBe(3)
-    })
+    mockFetchMessages.mockRejectedValueOnce(new Error('Stop loop'))
+    await expect(promise).rejects.toThrow('Stop loop')
   })
 })
